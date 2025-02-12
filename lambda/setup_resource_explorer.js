@@ -9,12 +9,20 @@ const {
   UpdateIndexTypeCommand,
   ListIndexesCommand,
   CreateViewCommand,
-  AssociateDefaultViewCommand
+  AssociateDefaultViewCommand,
+  DeleteIndexCommand,
+  DeleteViewCommand,
+  ListViewsCommand,
+  DisassociateDefaultViewCommand
 } = require('@aws-sdk/client-resource-explorer-2');
 const {
   AccountClient,
   ListRegionsCommand
 } = require('@aws-sdk/client-account');
+const {
+  OrganizationsClient,
+  ListAccountsCommand
+} = require('@aws-sdk/client-organizations');
 const { 
   IAMClient, 
   CreateRoleCommand, 
@@ -23,6 +31,36 @@ const {
 } = require('@aws-sdk/client-iam');
 const fs = require('fs');
 const path = require('path');
+
+async function discoverAccounts() {
+  console.log('Starting account discovery');
+  const organizations = new OrganizationsClient({ region: 'us-east-1' });
+  const accounts = [];
+  let nextToken;
+
+  try {
+    do {
+      const command = new ListAccountsCommand({
+        NextToken: nextToken
+      });
+      const response = await organizations.send(command);
+      
+      for (const account of response.Accounts) {
+        if (account.Status === 'ACTIVE' && account.Id !== process.env.ROOT_ACCOUNT_ID) {
+          accounts.push(account.Id);
+        }
+      }
+      
+      nextToken = response.NextToken;
+    } while (nextToken);
+
+    console.log('Discovered accounts:', accounts);
+    return accounts;
+  } catch (error) {
+    console.error('Error discovering accounts:', error);
+    throw error;
+  }
+}
 
 async function getCredentialsForAccount(accountId) {
   if (!accountId) {
@@ -110,146 +148,62 @@ async function createResourceListerRole(accountId, credentials) {
 }
 
 async function setupResourceExplorer(accountId, credentials, regions) {
-  // First set up us-west-2 as it will be the aggregator
-  const usw2Region = 'us-west-2';
-  console.log(`Setting up index in ${usw2Region}`);
-  
-  const usw2Explorer = new ResourceExplorer2Client({
-    region: usw2Region,
-    credentials
-  });
+  const summary = {
+    accountId,
+    activeRegions: regions,
+    deployedIndexes: [],
+    aggregatorRegion: null,
+    defaultView: null,
+    errors: []
+  };
 
-  // Create/verify us-west-2 index
-  try {
-    let indexExists = false;
-    try {
-      const { State } = await usw2Explorer.send(new GetIndexCommand({}));
-      if (State === 'ACTIVE') {
-        console.log(`Index already exists in ${usw2Region}`);
-        indexExists = true;
-      }
-    } catch (error) {
-      if (error.name !== 'ResourceNotFoundException') throw error;
-    }
+  console.log(`\n=== Account ${accountId} Setup Summary ===`);
+  console.log('Active regions discovered:', regions.join(', '));
 
-    if (!indexExists) {
-      await usw2Explorer.send(new CreateIndexCommand({}));
-      console.log(`Created index in ${usw2Region}`);
-      
-      // Wait for index to be active
-      let indexState = '';
-      while (indexState !== 'ACTIVE') {
-        const { State } = await usw2Explorer.send(new GetIndexCommand({}));
-        indexState = State;
-        if (indexState !== 'ACTIVE') {
-          console.log(`Waiting for index to be active... Current state: ${indexState}`);
-          await new Promise(resolve => setTimeout(resolve, 5000));
-        }
-      }
-    }
-
-    // Check for existing aggregator
-    console.log('Checking for existing aggregator...');
-    const { Indexes } = await usw2Explorer.send(new ListIndexesCommand({}));
-    const hasAggregator = Indexes.some(index => index.Type === 'AGGREGATOR');
-    const currentIndex = Indexes.find(index => index.Region === usw2Region);
-
-    if (!hasAggregator && currentIndex) {
-      try {
-        console.log('Promoting index to aggregator...');
-        await usw2Explorer.send(new UpdateIndexTypeCommand({
-          Arn: currentIndex.Arn,
-          Type: 'AGGREGATOR'
-        }));
-        console.log('Successfully promoted index to aggregator');
-      } catch (error) {
-        if (error.name === 'ServiceQuotaExceededException' || 
-            error.message.includes('cool down period')) {
-          console.log('Skipping aggregator promotion due to cooldown period');
-        } else {
-          throw error;
-        }
-      }
-    }
-
-    // Create and set default view
-    try {
-      console.log('Creating default view...');
-      const createViewResponse = await usw2Explorer.send(new CreateViewCommand({
-        ViewName: 'all-resources-p0',
-        Filters: {
-          FilterString: ""
-        }
-      }));
-
-      console.log('Setting as default view...');
-      await usw2Explorer.send(new AssociateDefaultViewCommand({
-        ViewArn: createViewResponse.View.ViewArn
-      }));
-      console.log('Successfully set default view');
-    } catch (error) {
-      if (!error.message.includes('already exists')) {
-        throw error;
-      }
-      console.log('View already exists');
-    }
-  } catch (error) {
-    console.error(`Error setting up aggregator in ${usw2Region}:`, error);
-    throw error;
-  }
-
-  // Create indexes in other regions
-  console.log('Creating indexes in other regions...');
-  for (const region of regions.filter(r => r !== usw2Region)) {
-    console.log(`Processing region ${region}`);
-    
+  // First check if there's an existing aggregator in any region
+  let existingAggregatorRegion = null;
+  for (const region of regions) {
     const explorer = new ResourceExplorer2Client({
       region,
       credentials
     });
 
     try {
-      // Check if index exists
-      try {
-        const { State } = await explorer.send(new GetIndexCommand({}));
-        if (State === 'ACTIVE') {
-          console.log(`Index already exists in ${region}`);
-          continue;
-        }
-      } catch (error) {
-        if (error.name !== 'ResourceNotFoundException') {
-          console.error(`Error checking index in ${region}:`, error);
-          continue;
-        }
+      const { Indexes } = await explorer.send(new ListIndexesCommand({}));
+      const aggregator = Indexes.find(index => index.Type === 'AGGREGATOR');
+      if (aggregator) {
+        existingAggregatorRegion = region;
+        console.log(`Found existing aggregator in ${region}`);
+        summary.aggregatorRegion = region;
+        break;
       }
-
-      // Create index
-      await explorer.send(new CreateIndexCommand({}));
-      console.log(`Created index in ${region}`);
     } catch (error) {
-      console.error(`Error creating index in ${region}:`, error);
+      const errorMsg = `Error checking for aggregator in ${region}: ${error.message}`;
+      console.error(errorMsg);
+      summary.errors.push(errorMsg);
     }
   }
-}
 
-async function setupResourceExplorer(accountId, credentials, regions, skipAggregator = false) {
-  // First set up us-west-2 as it will be the aggregator
+  // If no aggregator exists, set up us-west-2 as aggregator
   const usw2Region = 'us-west-2';
-  console.log(`Setting up index in ${usw2Region}`);
+  const shouldSetupAggregator = !existingAggregatorRegion;
   
+  // Setup us-west-2 first since it might be our aggregator
+  console.log(`\nSetting up index in ${usw2Region}`);
   const usw2Explorer = new ResourceExplorer2Client({
     region: usw2Region,
     credentials
   });
 
-  // Create/verify us-west-2 index
   try {
+    // Create/verify us-west-2 index
     let indexExists = false;
     try {
       const { State } = await usw2Explorer.send(new GetIndexCommand({}));
       if (State === 'ACTIVE') {
         console.log(`Index already exists in ${usw2Region}`);
         indexExists = true;
+        summary.deployedIndexes.push(usw2Region);
       }
     } catch (error) {
       if (error.name !== 'ResourceNotFoundException') throw error;
@@ -258,17 +212,16 @@ async function setupResourceExplorer(accountId, credentials, regions, skipAggreg
     if (!indexExists) {
       await usw2Explorer.send(new CreateIndexCommand({}));
       console.log(`Created index in ${usw2Region}`);
+      summary.deployedIndexes.push(usw2Region);
     }
 
-    // Only attempt aggregator setup if not skipped
-    if (!skipAggregator) {
-      // Check for existing aggregator
-      console.log('Checking for existing aggregator...');
+    // Promote to aggregator if needed
+    if (shouldSetupAggregator) {
+      console.log('Setting up aggregator in us-west-2...');
       const { Indexes } = await usw2Explorer.send(new ListIndexesCommand({}));
-      const hasAggregator = Indexes.some(index => index.Type === 'AGGREGATOR');
       const currentIndex = Indexes.find(index => index.Region === usw2Region);
 
-      if (!hasAggregator && currentIndex) {
+      if (currentIndex && currentIndex.Type !== 'AGGREGATOR') {
         try {
           console.log('Promoting index to aggregator...');
           await usw2Explorer.send(new UpdateIndexTypeCommand({
@@ -276,49 +229,73 @@ async function setupResourceExplorer(accountId, credentials, regions, skipAggreg
             Type: 'AGGREGATOR'
           }));
           console.log('Successfully promoted index to aggregator');
-
-          // Create and set default view
-          try {
-            console.log('Creating default view...');
-            const createViewResponse = await usw2Explorer.send(new CreateViewCommand({
-              ViewName: 'all-resources-p0',
-              Filters: {
-                FilterString: ""
-              }
-            }));
-
-            console.log('Setting as default view...');
-            await usw2Explorer.send(new AssociateDefaultViewCommand({
-              ViewArn: createViewResponse.View.ViewArn
-            }));
-            console.log('Successfully set default view');
-          } catch (error) {
-            if (!error.message.includes('already exists')) {
-              throw error;
-            }
-            console.log('View already exists');
-          }
+          summary.aggregatorRegion = usw2Region;
         } catch (error) {
+          const errorMsg = `Error promoting index to aggregator: ${error.message}`;
           if (error.name === 'ServiceQuotaExceededException' || 
               error.message.includes('cool down period')) {
             console.log('Skipping aggregator promotion due to cooldown period');
+            summary.errors.push(`${errorMsg} (cooldown period)`);
           } else {
+            console.error(errorMsg);
+            summary.errors.push(errorMsg);
             throw error;
           }
         }
-      } else {
-        console.log('Aggregator already exists or index not found');
       }
-    } else {
-      console.log('Skipping aggregator setup as requested');
+    }
+
+    // Create and set default view in the aggregator region
+    const aggregatorRegion = existingAggregatorRegion || (shouldSetupAggregator ? usw2Region : null);
+    if (aggregatorRegion) {
+      const aggregatorExplorer = new ResourceExplorer2Client({
+        region: aggregatorRegion,
+        credentials
+      });
+
+      try {
+        console.log(`Creating default view in aggregator region ${aggregatorRegion}...`);
+        const createViewResponse = await aggregatorExplorer.send(new CreateViewCommand({
+          ViewName: 'all-resources-p0',
+          Filters: {
+            FilterString: ""
+          }
+        }));
+
+        console.log('Setting as default view...');
+        await aggregatorExplorer.send(new AssociateDefaultViewCommand({
+          ViewArn: createViewResponse.View.ViewArn
+        }));
+        console.log('Successfully set default view');
+        summary.defaultView = {
+          region: aggregatorRegion,
+          viewName: 'all-resources-p0',
+          viewArn: createViewResponse.View.ViewArn
+        };
+      } catch (error) {
+        if (!error.message.includes('already exists')) {
+          const errorMsg = `Error setting up default view: ${error.message}`;
+          console.error(errorMsg);
+          summary.errors.push(errorMsg);
+          throw error;
+        }
+        console.log('View already exists');
+        summary.defaultView = {
+          region: aggregatorRegion,
+          viewName: 'all-resources-p0',
+          status: 'already exists'
+        };
+      }
     }
   } catch (error) {
-    console.error(`Error in ${usw2Region}:`, error);
+    const errorMsg = `Error in ${usw2Region}: ${error.message}`;
+    console.error(errorMsg);
+    summary.errors.push(errorMsg);
     throw error;
   }
 
   // Create indexes in other regions
-  console.log('Creating indexes in other regions...');
+  console.log('\nCreating indexes in other regions...');
   for (const region of regions.filter(r => r !== usw2Region)) {
     console.log(`Processing region ${region}`);
     
@@ -333,11 +310,14 @@ async function setupResourceExplorer(accountId, credentials, regions, skipAggreg
         const { State } = await explorer.send(new GetIndexCommand({}));
         if (State === 'ACTIVE') {
           console.log(`Index already exists in ${region}`);
+          summary.deployedIndexes.push(region);
           continue;
         }
       } catch (error) {
         if (error.name !== 'ResourceNotFoundException') {
-          console.error(`Error checking index in ${region}:`, error);
+          const errorMsg = `Error checking index in ${region}: ${error.message}`;
+          console.error(errorMsg);
+          summary.errors.push(errorMsg);
           continue;
         }
       }
@@ -345,119 +325,196 @@ async function setupResourceExplorer(accountId, credentials, regions, skipAggreg
       // Create index
       await explorer.send(new CreateIndexCommand({}));
       console.log(`Created index in ${region}`);
+      summary.deployedIndexes.push(region);
     } catch (error) {
-      console.error(`Error creating index in ${region}:`, error);
+      const errorMsg = `Error creating index in ${region}: ${error.message}`;
+      console.error(errorMsg);
+      summary.errors.push(errorMsg);
+    }
+  }
+
+  // Print final summary
+  console.log('\n=== Final Setup Summary ===');
+  console.log(JSON.stringify(summary, null, 2));
+  
+  return summary;
+}
+
+async function cleanupResourceExplorer(accountId, credentials, regions) {
+  console.log(`Cleaning up Resource Explorer in account ${accountId}`);
+
+  // Clean up indexes in all regions including us-west-2
+  for (const region of regions) {
+    console.log(`Cleaning up region ${region}`);
+    
+    const explorer = new ResourceExplorer2Client({
+      region,
+      credentials
+    });
+
+    try {
+      // First disassociate default view if it exists (only in us-west-2)
+      if (region === 'us-west-2') {
+        try {
+          console.log('Disassociating default view...');
+          await explorer.send(new DisassociateDefaultViewCommand({}));
+        } catch (error) {
+          if (!error.name.includes('ResourceNotFoundException')) {
+            console.error('Error disassociating default view:', error);
+          }
+        }
+      }
+
+      // List and delete all views
+      try {
+        const { Views } = await explorer.send(new ListViewsCommand({}));
+        for (const view of Views || []) {
+          console.log(`Deleting view ${view.ViewName}`);
+          await explorer.send(new DeleteViewCommand({
+            ViewArn: view.ViewArn
+          }));
+        }
+      } catch (error) {
+        console.error(`Error cleaning up views in ${region}:`, error);
+      }
+
+      // Delete the index
+      try {
+        console.log(`Deleting index in ${region}`);
+        await explorer.send(new DeleteIndexCommand({}));
+      } catch (error) {
+        if (!error.name.includes('ResourceNotFoundException')) {
+          console.error(`Error deleting index in ${region}:`, error);
+        }
+      }
+    } catch (error) {
+      console.error(`Error cleaning up Resource Explorer in ${region}:`, error);
     }
   }
 }
 
 exports.handler = async (event) => {
+  console.log('Event:', JSON.stringify(event));
+  
   try {
-    // Check if we should skip aggregator setup
-    const skipAggregator = event?.skipAggregator || false;
-    console.log(skipAggregator ? 'Will skip aggregator setup' : 'Will setup aggregator');
+    // Handle discovery action
+    if (event.action === 'discover') {
+      console.log('Running account discovery');
+      const accounts = await discoverAccounts();
+      return { accounts: accounts };
+    }
 
+    // Handle destroy action
+    if (event.action === 'destroy') {
+      console.log('Running cleanup');
+      
+      // Get list of enabled regions
+      const accountClient = new AccountClient({ region: 'us-east-1' });
+      const { Regions } = await accountClient.send(new ListRegionsCommand({}));
+
+      const enabledRegions = Regions
+        .filter(r => ['ENABLED', 'ENABLING', 'ENABLED_BY_DEFAULT'].includes(r.RegionOptStatus))
+        .map(r => r.RegionName);
+      
+      console.log('Filtered enabled regions:', enabledRegions);
+      
+      if (!enabledRegions.includes('us-west-2')) {
+        enabledRegions.push('us-west-2');
+      }
+
+      // Use provided accounts from event
+      const accounts = event.accounts || [];
+      console.log('Cleaning up accounts:', accounts);
+
+      for (const accountId of accounts) {
+        try {
+          console.log(`\nCleaning up account ${accountId}`);
+          const credentials = await getCredentialsForAccount(accountId);
+          await cleanupResourceExplorer(accountId, credentials, enabledRegions);
+          console.log(`Successfully cleaned up account ${accountId}`);
+        } catch (error) {
+          console.error(`Failed to clean up account ${accountId}:`, error);
+          throw error;
+        }
+      }
+
+      return {
+        statusCode: 200,
+        body: JSON.stringify({
+          message: 'Cleanup completed successfully',
+          processedAccounts: accounts
+        })
+      };
+    }
+
+    // Regular setup logic
+    const setupResults = [];
+    console.log('Setup options:', {
+      skipAggregator: event.skipAggregator || false,
+      skipDefaultView: event.skipDefaultView || false
+    });
+    
     // Get list of enabled regions
     const accountClient = new AccountClient({ region: 'us-east-1' });
     const { Regions } = await accountClient.send(new ListRegionsCommand({}));
     
-    console.log('All regions and their status:', JSON.stringify(Regions, null, 2));
-    
     const enabledRegions = Regions
       .filter(r => r.RegionOptStatus === 'ENABLED' || r.RegionOptStatus === 'ENABLING')
       .map(r => r.RegionName);
-
-    console.log('Processing explicitly enabled regions:', enabledRegions);
     
     if (!enabledRegions.includes('us-west-2')) {
-      console.log('Adding us-west-2 as it is required for the aggregator');
       enabledRegions.push('us-west-2');
     }
 
-    if (enabledRegions.length === 0) {
-      console.error('No enabled regions found! This is unexpected.');
-      enabledRegions.push('us-west-2');
-    }
+    // Use provided accounts from event
+    const accounts = event.accounts || [];
+    console.log('Processing accounts:', accounts);
 
-    // Process member accounts
-    const memberAccounts = JSON.parse(process.env.MEMBER_ACCOUNTS || '[]');
-    console.log('Processing member accounts:', memberAccounts);
-
-    for (const accountId of memberAccounts) {
+    for (const accountId of accounts) {
       try {
         console.log(`\nProcessing account ${accountId}`);
-        const credentials = await getCredentialsForAccount(accountId);
         
-        // Create role and policy
-        await createResourceListerRole(accountId, credentials);
+        // Get credentials for member accounts
+        let credentials;
+        if (accountId !== process.env.ROOT_ACCOUNT_ID) {
+          credentials = await getCredentialsForAccount(accountId);
+          await createResourceListerRole(accountId, credentials);
+        }
         
-        // Set up Resource Explorer
-        await setupResourceExplorer(accountId, credentials, enabledRegions, skipAggregator);
+        const summary = await setupResourceExplorer(
+          accountId, 
+          credentials,
+          enabledRegions
+        );
         
+        setupResults.push(summary);
         console.log(`Successfully processed account ${accountId}`);
       } catch (error) {
         console.error(`Failed to process account ${accountId}:`, error);
-        // Continue with next account
+        setupResults.push({
+          accountId,
+          error: error.message,
+          status: 'failed',
+          activeRegions: enabledRegions
+        });
+        throw error;  // Propagate error to ensure Lambda fails
       }
     }
 
-    return {
-      statusCode: 200,
-      body: 'Setup completed successfully'
-    };
-  } catch (error) {
-    console.error('Lambda execution error:', error);
-    throw error;
-  }
-};
-  try {
-// Get list of enabled regions
-    const accountClient = new AccountClient({ region: 'us-east-1' });
-    const { Regions } = await accountClient.send(new ListRegionsCommand({}));
-    
-    console.log('All regions and their status:', JSON.stringify(Regions, null, 2));
-    
-    const enabledRegions = Regions
-      .filter(r => r.RegionOptStatus === 'ENABLED' || r.RegionOptStatus === 'ENABLING')
-      .map(r => r.RegionName);
-
-    console.log('Processing explicitly enabled regions:', enabledRegions);
-    
-    if (!enabledRegions.includes('us-west-2')) {
-      console.log('Adding us-west-2 as it is required for the aggregator');
-      enabledRegions.push('us-west-2');
-    }
-
-    if (enabledRegions.length === 0) {
-      console.error('No enabled regions found! This is unexpected.');
-      enabledRegions.push('us-west-2');
-    }
-
-    // Process member accounts
-    const memberAccounts = JSON.parse(process.env.MEMBER_ACCOUNTS || '[]');
-    console.log('Processing member accounts:', memberAccounts);
-
-    for (const accountId of memberAccounts) {
-      try {
-        console.log(`\nProcessing account ${accountId}`);
-        const credentials = await getCredentialsForAccount(accountId);
-        
-        // Create role and policy
-        await createResourceListerRole(accountId, credentials);
-        
-        // Set up Resource Explorer
-        await setupResourceExplorer(accountId, credentials, enabledRegions);
-        
-        console.log(`Successfully processed account ${accountId}`);
-      } catch (error) {
-        console.error(`Failed to process account ${accountId}:`, error);
-        // Continue with next account
-      }
-    }
+    console.log('\n=== Complete Setup Results ===');
+    console.log(JSON.stringify({
+      setupResults,
+      totalAccounts: accounts.length,
+      successfulSetups: setupResults.filter(r => !r.error).length,
+      failedSetups: setupResults.filter(r => r.error).length
+    }, null, 2));
 
     return {
       statusCode: 200,
-      body: 'Setup completed successfully'
+      body: JSON.stringify({
+        message: 'Setup completed',
+        results: setupResults
+      }, null, 2)
     };
   } catch (error) {
     console.error('Lambda execution error:', error);

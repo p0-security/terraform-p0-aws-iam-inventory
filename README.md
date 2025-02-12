@@ -1,6 +1,6 @@
 # AWS Resource Explorer Setup
 
-This Terraform project sets up AWS Resource Explorer with indexes across enabled regions in both root and member accounts of an AWS Organization. It also creates necessary IAM roles for managing resources.
+This Terraform project sets up AWS Resource Explorer with indexes across enabled regions in both root and member accounts of an AWS Organization. It also creates necessary IAM roles for managing resources and configures P0 Security integration.
 
 ## Prerequisites
 
@@ -27,10 +27,22 @@ This Terraform project sets up AWS Resource Explorer with indexes across enabled
 
 3. AWS Identity Center (formerly SSO) configured
 
-4. Required Permissions:
+4. P0 Security:
+   - Valid P0 Security API token
+   - Tenant/organization name in P0 Security
+
+5. Required Permissions:
    - Ability to assume TerraformExecutionRole in root account
    - Ability to assume OrganizationAccountAccessRole in member accounts
    - Resource Explorer administrative permissions
+
+## Environment Variables
+
+The following environment variables must be set:
+
+```bash
+export P0_API_TOKEN="your-p0-security-api-token"
+```
 
 ## IAM Roles Overview
 
@@ -70,11 +82,19 @@ This Terraform project sets up AWS Resource Explorer with indexes across enabled
 ## Steps
 
 1. Edit the file terraform.tfvars in the root folder as follows:
-    1. Add your root account as a string value
-    2. Add your children/member accounts in an array of comma separated strings
-    3. Add the P0 Security Google Audience ID
+    ```hcl
+    root_account_id     = "your-root-account-id"
+    member_accounts     = ["member-account-1", "member-account-2"]  # Optional
+    google_audience_id  = "your-google-audience-id"
+    tenant             = "your-p0-tenant-name"  # e.g., "SE-test-org"
+    ```
 
-2. In the root folder, run the following commands:
+2. Set the required environment variable:
+    ```bash
+    export P0_API_TOKEN="your-p0-security-api-token"
+    ```
+
+3. In the root folder, run the following commands:
     ```bash
     terraform init
     terraform plan
@@ -104,7 +124,7 @@ project_root/
    - Created by TerraformExecutionRole:
      - P0RoleIamResourceLister role with Google federation
      - Resource Explorer indexes in enabled regions
-     - Aggregator index in us-west-2
+     - Aggregator index in us-west-2 (if no aggregator exists)
      - Default view configuration
      - Lambda function and its roles
 
@@ -112,8 +132,13 @@ project_root/
    - Created by Lambda (which assumes OrganizationAccountAccessRole):
      - P0RoleIamResourceLister role with same Google federation
      - Resource Explorer indexes in enabled regions
-     - Aggregator index in us-west-2
+     - Aggregator index in us-west-2 (if no aggregator exists)
      - Default view configuration
+
+3. P0 Security Integration:
+   - Configures inventory setup for each account
+   - Verifies and configures P0 Security integration
+   - Sets up appropriate labels and states
 
 ## Workflow
 
@@ -123,11 +148,10 @@ project_root/
    ```
    - Terraform uses your provided TerraformExecutionRole to create resources in root account
 
-2. Lambda Creation:
-   - Terraform creates a zip package containing:
-     - Lambda function code (setup_resource_explorer.js)
-     - Policy template (resource_lister_policy.json)
-   - Package is uploaded to AWS Lambda
+2. Lambda Creation and Account Discovery:
+   - Creates Lambda with required dependencies using Lambda layers
+   - Discovers member accounts if not explicitly provided
+   - Creates required roles and indexes in discovered accounts
 
 3. Member Account Setup:
    ```
@@ -137,10 +161,18 @@ project_root/
    - For each account:
      - Assumes the OrganizationAccountAccessRole
      - Creates P0RoleIamResourceLister with Google federation
-     - Sets up Resource Explorer indexes and aggregator
+     - Sets up Resource Explorer indexes and aggregator if needed
      - Configures default view
 
-4. Final Trust Chain:
+4. P0 Security Setup:
+   ```
+   Terraform → P0 API → Configure Integration
+   ```
+   - Configures P0 Security integration for each account
+   - Sets up inventory
+   - Verifies and configures integration
+
+5. Final Trust Chain:
    ```
    Google Federation → P0RoleIamResourceLister (in any account)
    ```
@@ -153,8 +185,18 @@ Monitor Lambda execution:
 aws logs tail /aws/lambda/setup-resource-explorer --follow
 ```
 
+The Lambda provides detailed logging of:
+- Active regions discovered
+- Indexes deployed
+- Aggregator status and location
+- Default view configuration
+- Any errors encountered
+
 ## Important Notes
 
 - The Lambda function can be rerun safely as it checks for existing resources
 - Resource Explorer aggregator setup has a 24-hour cooldown period
+- Member accounts can be explicitly provided or auto-discovered
+- Each account's setup includes comprehensive logging of enabled regions and deployed resources
+- The P0_API_TOKEN environment variable must be set before running Terraform
 - The Lambda can be run with `skipAggregator: true` to test region setup without modifying aggregator settings

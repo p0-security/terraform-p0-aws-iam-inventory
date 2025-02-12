@@ -1,0 +1,21 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "P0CanListResources",
+      "Effect": "Allow",
+      "Action": [
+        "resource-explorer-2:ListIndexes",
+        "resource-explorer-2:Search",
+        "iam:GetRole",
+        "iam:GetRolePolicy"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceAccount": "${account_id}"
+        }
+      }
+    }
+  ]
+}

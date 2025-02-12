@@ -12,3 +12,8 @@ variable "google_audience_id" {
   description = "Google Workspace audience ID for federation"
   type        = string
 }
+
+variable "tenant" {
+  description = "P0 tenant/organization name (e.g., SE-test-org)"
+  type        = string
+}
