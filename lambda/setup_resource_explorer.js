@@ -459,9 +459,9 @@ exports.handler = async (event) => {
     const { Regions } = await accountClient.send(new ListRegionsCommand({}));
     
     const enabledRegions = Regions
-      .filter(r => r.RegionOptStatus === 'ENABLED' || r.RegionOptStatus === 'ENABLING')
+      .filter(r => ['ENABLED', 'ENABLING', 'ENABLED_BY_DEFAULT'].includes(r.RegionOptStatus))
       .map(r => r.RegionName);
-    
+
     if (!enabledRegions.includes('us-west-2')) {
       enabledRegions.push('us-west-2');
     }
